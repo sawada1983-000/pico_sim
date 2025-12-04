@@ -1,15 +1,15 @@
 {
   "files": {
     "main.css": "/pico_sim/static/css/main.e6c13ad2.css",
-    "main.js": "/pico_sim/static/js/main.3b7855d8.js",
+    "main.js": "/pico_sim/static/js/main.a06874d4.js",
     "static/js/453.f10e131a.chunk.js": "/pico_sim/static/js/453.f10e131a.chunk.js",
     "index.html": "/pico_sim/index.html",
     "main.e6c13ad2.css.map": "/pico_sim/static/css/main.e6c13ad2.css.map",
-    "main.3b7855d8.js.map": "/pico_sim/static/js/main.3b7855d8.js.map",
+    "main.a06874d4.js.map": "/pico_sim/static/js/main.a06874d4.js.map",
     "453.f10e131a.chunk.js.map": "/pico_sim/static/js/453.f10e131a.chunk.js.map"
   },
   "entrypoints": [
     "static/css/main.e6c13ad2.css",
-    "static/js/main.3b7855d8.js"
+    "static/js/main.a06874d4.js"
   ]
 }
