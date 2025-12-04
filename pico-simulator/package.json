@@ -1,7 +1,7 @@
 {
   "name": "pico-simulator",
   "version": "0.1.0",
-  "homepage": "https://sawada1983-000.github.io/pico-sim",
+  "homepage": "https://sawada1983-000.github.io/pico_sim",
   "private": true,
   "dependencies": {
     "@react-three/drei": "^10.7.7",

@@ -62,29 +62,53 @@ def print(*args):
     setLogs(prev => [...prev, ">>> 停止 (リセット)"]);
   };
 
-  return { pinStates, ready, logs, run, stop };
+  return { pinStates, ready, logs, run, stop, isRunning: isRunningRef.current };
 }
 
 // --- 2. 座標 & 物理定数 ---
 const PITCH = 0.254;
 const ROW_COUNT = 30;
+const GAP_CENTER = 0.762;
 
+// ★改良: 電源レール対応の座標計算
+// Col 0, -1: 左電源レール / Col 11, 12: 右電源レール
 function getHolePos(row, col) {
   const zOffset = -((ROW_COUNT - 1) * PITCH) / 2;
   const z = zOffset + (row - 1) * PITCH;
   let x = 0;
-  if (col <= 5) x = -((GAP_CENTER / 2) + (5 - col) * PITCH);
-  else x = (GAP_CENTER / 2) + (col - 6) * PITCH;
+
+  if (col >= 1 && col <= 5) { // Main Left
+    x = -(0.3 + (5 - col) * PITCH);
+  } else if (col >= 6 && col <= 10) { // Main Right
+    x = (0.3 + (col - 6) * PITCH);
+  } else if (col === 0) { // Power L Inner (+)
+    x = -2.0;
+  } else if (col === -1) { // Power L Outer (-)
+    x = -2.3;
+  } else if (col === 11) { // Power R Inner (+)
+    x = 2.0;
+  } else if (col === 12) { // Power R Outer (-)
+    x = 2.3;
+  }
   return [x, 0.15, z];
 }
-const GAP_CENTER = 0.762;
 
+// 穴ID生成 (電源レール対応)
 function getHoleId(row, col) {
+  if (col === 0) return `PL+-${row}`; // Power Left +
+  if (col === -1) return `PL--${row}`; // Power Left -
+  if (col === 11) return `PR+-${row}`; // Power Right +
+  if (col === 12) return `PR--${row}`; // Power Right -
+  
   const side = col <= 5 ? 'L' : 'R';
   return `${side}-${row}`;
 }
 
+// PicoのGNDピン定義 (Row番号)
+const GND_ROWS = [3, 8, 13, 18, 23, 28]; 
+
 function getGpioFromHole(row, col) {
+  if (col < 1 || col > 10) return null; // 電源レールにはPico刺さらない
   if (col <= 5) {
     const leftMap = { 1:0, 2:1, 4:2, 5:3, 6:4, 7:5, 9:6, 10:7, 11:8, 12:9, 14:10, 15:11, 16:12, 17:13, 19:14, 20:15 };
     return leftMap[row] !== undefined ? leftMap[row] : null;
@@ -98,23 +122,26 @@ function getGpioFromHole(row, col) {
 function Tooltip({ position, text }) {
   return (
     <Html position={position} style={{ pointerEvents: 'none' }}>
-      <div style={{ background: 'rgba(0,0,0,0.8)', color: 'white', padding: '4px 8px', borderRadius: '4px', fontSize: '12px', whiteSpace: 'nowrap', transform: 'translate3d(-50%, -150%, 0)' }}>
+      <div style={{ background: 'rgba(0,0,0,0.85)', color: '#0f0', padding: '6px 10px', borderRadius: '6px', fontSize: '14px', fontFamily: 'monospace', whiteSpace: 'pre-wrap', transform: 'translate3d(-50%, -150%, 0)', border: '1px solid #444', boxShadow: '0 4px 6px rgba(0,0,0,0.3)' }}>
         {text}
       </div>
     </Html>
   );
 }
 
-function Electron({ path, speed = 0.5, offset = 0 }) {
+function Electron({ path, speed = 0.5, offset = 0, reverse = false }) {
   const meshRef = useRef();
   const progress = useRef(offset);
+  const color = useMemo(() => new THREE.Color('#ffff00'), []);
+
   useFrame((state, delta) => {
     if (!meshRef.current || !path) return;
     progress.current += speed * delta;
     if (progress.current > 1) progress.current -= 1;
-    meshRef.current.position.copy(path.getPointAt(progress.current));
+    const t = reverse ? 1.0 - progress.current : progress.current;
+    meshRef.current.position.copy(path.getPointAt(t));
   });
-  return <mesh ref={meshRef}><sphereGeometry args={[0.025]} /><meshBasicMaterial color="#ffff00" toneMapped={false}/></mesh>;
+  return <mesh ref={meshRef}><sphereGeometry args={[0.04]} /><meshBasicMaterial color={color} toneMapped={false}/></mesh>;
 }
 
 function useComponentPath(start, end, height) {
@@ -122,17 +149,20 @@ function useComponentPath(start, end, height) {
     const pStart = new THREE.Vector3(...start);
     const pEnd = new THREE.Vector3(...end);
     const sink = 0.3;
-    const realStart = pStart.clone().setY(pStart.y - sink);
-    const realEnd = pEnd.clone().setY(pEnd.y - sink);
-    const upStart = pStart.clone().setY(height);
-    const upEnd = pEnd.clone().setY(height);
-    const points = [realStart, pStart, upStart, upEnd, pEnd, realEnd];
+    const points = [
+      pStart.clone().setY(pStart.y - sink),
+      pStart,
+      pStart.clone().setY(height),
+      pEnd.clone().setY(height),
+      pEnd,
+      pEnd.clone().setY(pEnd.y - sink)
+    ];
     return new THREE.CatmullRomCurve3(points, false, 'catmullrom', 0.05);
   }, [start, end, height]);
 }
 
-function ResistorComponent({ item, hasCurrent, setHoverInfo }) {
-  const { sR, sC, eR, eC, scale, ohms = 330 } = item;
+function ResistorComponent({ item, setHoverInfo, hasCurrent }) {
+  const { sR, sC, eR, eC, scale, ohms = 330, name } = item;
   const start = getHolePos(sR, sC);
   const end = getHolePos(eR, eC);
   const height = 0.4 * scale;
@@ -141,10 +171,12 @@ function ResistorComponent({ item, hasCurrent, setHoverInfo }) {
   const direction = new THREE.Vector3(...end).sub(new THREE.Vector3(...start));
   const angleY = Math.atan2(direction.x, direction.z) + Math.PI / 2;
   const legRadius = 0.015 * scale;
+  
+  const tooltipText = `[${name || 'Res'}]\n${ohms}Ω`;
 
   return (
     <group 
-      onPointerOver={(e) => { e.stopPropagation(); setHoverInfo({ pos: mid, text: `${ohms}Ω` }); }}
+      onPointerOver={(e) => { e.stopPropagation(); setHoverInfo({ pos: mid, text: tooltipText }); }}
       onPointerOut={() => setHoverInfo(null)}
     >
       <group position={mid} rotation={[0, angleY, 0]} scale={[scale, scale, scale]}>
@@ -155,22 +187,23 @@ function ResistorComponent({ item, hasCurrent, setHoverInfo }) {
         <mesh rotation={[0,0,Math.PI/2]} position={[-0.2, 0, 0]}><cylinderGeometry args={[0.125, 0.125, 0.05]} /><meshStandardMaterial color="gold" metalness={0.8} /></mesh>
       </group>
       <Tube args={[path, 64, legRadius, 8, false]}><meshStandardMaterial color="silver" metalness={0.8} roughness={0.2} /></Tube>
-      {hasCurrent && [0, 0.2, 0.4, 0.6, 0.8].map(i => <Electron key={i} path={path} offset={i} speed={0.5} />)}
+      {hasCurrent && [0, 0.2, 0.4, 0.6, 0.8].map(i => <Electron key={i} path={path} offset={i} />)}
     </group>
   );
 }
 
-function LEDComponent({ item, hasCurrent, setHoverInfo }) {
-  const { sR, sC, eR, eC } = item;
+function LEDComponent({ item, setHoverInfo, hasCurrent }) {
+  const { sR, sC, eR, eC, name } = item;
   const start = getHolePos(sR, sC);
   const end = getHolePos(eR, eC);
   const height = 0.5;
   const path = useComponentPath(start, end, height);
   const mid = new THREE.Vector3(...start).add(new THREE.Vector3(...end)).multiplyScalar(0.5).setY(height + 0.1); 
+  const tooltipText = `[${name || 'LED'}]`;
 
   return (
     <group
-      onPointerOver={(e) => { e.stopPropagation(); setHoverInfo({ pos: mid, text: `LED` }); }}
+      onPointerOver={(e) => { e.stopPropagation(); setHoverInfo({ pos: mid, text: tooltipText }); }}
       onPointerOut={() => setHoverInfo(null)}
     >
       <group position={mid}>
@@ -184,26 +217,28 @@ function LEDComponent({ item, hasCurrent, setHoverInfo }) {
   );
 }
 
-function CleanWire({ item, hasCurrent, setHoverInfo }) {
-  const { sR, sC, eR, eC, color } = item;
+function CleanWire({ item, setHoverInfo, hasCurrent }) {
+  const { sR, sC, eR, eC, color: userColor, name } = item;
   const start = getHolePos(sR, sC);
   const end = getHolePos(eR, eC);
   const path = useMemo(() => {
     const pStart = new THREE.Vector3(...start); pStart.y += 0.15;
     const pEnd = new THREE.Vector3(...end); pEnd.y += 0.15;
-    const lift = 0.5 + (2 * 0.2); 
-    const points = [pStart, new THREE.Vector3(pStart.x, lift, pStart.z), new THREE.Vector3(pEnd.x, lift, pEnd.z), pEnd];
+    const points = [pStart, new THREE.Vector3(pStart.x, 0.5 + 2*0.2, pStart.z), new THREE.Vector3(pEnd.x, 0.5 + 2*0.2, pEnd.z), pEnd];
     return new THREE.CatmullRomCurve3(points, false, 'catmullrom', 0.1);
   }, [start, end]);
 
   const mid = path.getPointAt(0.5);
+  const tooltipText = `[${name || 'Wire'}]`;
 
   return (
     <group 
-      onPointerOver={(e) => { e.stopPropagation(); setHoverInfo({ pos: mid, text: `Wire` }); }}
+      onPointerOver={(e) => { e.stopPropagation(); setHoverInfo({ pos: mid, text: tooltipText }); }}
       onPointerOut={() => setHoverInfo(null)}
     >
-      <Tube args={[path, 64, 0.045, 8, false]}><meshPhysicalMaterial color={color} transparent opacity={0.4} roughness={0.2} metalness={0.1} /></Tube>
+      <Tube args={[path, 64, 0.045, 8, false]}>
+        <meshPhysicalMaterial color={userColor} transparent opacity={0.5} roughness={0.2} metalness={0.1} />
+      </Tube>
       <mesh position={[start[0],0.1,start[2]]}><cylinderGeometry args={[0.025,0.025,0.4]}/><meshStandardMaterial color="#ccc"/></mesh>
       <mesh position={[end[0],0.1,end[2]]}><cylinderGeometry args={[0.025,0.025,0.4]}/><meshStandardMaterial color="#ccc"/></mesh>
       {hasCurrent && [0,0.2,0.4,0.6,0.8].map(i => <Electron key={i} path={path} offset={i} />)}
@@ -211,23 +246,117 @@ function CleanWire({ item, hasCurrent, setHoverInfo }) {
   );
 }
 
-function Breadboard({ onHoleClick, selectedHole }) {
+// ★改良: 電源レールの内部接続も含めた可視化
+function BreadboardInternalFlow({ activeNodes, isSimulating }) {
+  const lines = useMemo(() => {
+    const flows = [];
+    const activeRows = new Set();
+    const powerLines = new Set();
+
+    activeNodes.forEach(id => {
+      if (id.startsWith('P')) { // 電源レール (PL+-, PR+-)
+        // PL+-1 -> PL+ (列全体)
+        const prefix = id.split('-')[0]; // PL+, PL-, PR+, PR-
+        powerLines.add(prefix);
+      } else {
+        const [side, rowStr] = id.split('-');
+        activeRows.add(`${side}-${parseInt(rowStr)}`);
+      }
+    });
+
+    // メインエリアの横線
+    activeRows.forEach(key => {
+      const [side, rowStr] = key.split('-');
+      const row = parseInt(rowStr);
+      const startCol = side === 'L' ? 1 : 6;
+      const endCol = side === 'L' ? 5 : 10;
+      const startPos = getHolePos(row, startCol);
+      const endPos = getHolePos(row, endCol);
+      startPos[1] = 0.16; endPos[1] = 0.16;
+      flows.push({ start: startPos, end: endPos, type: 'row' });
+    });
+
+    // 電源レールの縦線
+    powerLines.forEach(prefix => { // PL+ など
+      let col = 0;
+      if (prefix === 'PL+') col = 0;
+      else if (prefix === 'PL-') col = -1;
+      else if (prefix === 'PR+') col = 11;
+      else if (prefix === 'PR-') col = 12;
+      
+      const startPos = getHolePos(1, col);
+      const endPos = getHolePos(30, col);
+      startPos[1] = 0.16; endPos[1] = 0.16;
+      flows.push({ start: startPos, end: endPos, type: 'col' });
+    });
+
+    return flows;
+  }, [activeNodes]);
+
+  if (!isSimulating) return null;
+
+  return (
+    <group>
+      {lines.map((line, i) => {
+        if (line.type === 'row') {
+           return (
+             <mesh key={i} rotation={[-Math.PI/2, 0, 0]} position={[(line.start[0]+line.end[0])/2, 0.155, line.start[2]]}>
+               <planeGeometry args={[Math.abs(line.end[0] - line.start[0]), 0.15]} />
+               <meshBasicMaterial color="#ffff00" transparent opacity={0.3} side={THREE.DoubleSide} />
+             </mesh>
+           );
+        } else { // 電源レール (縦)
+           return (
+             <mesh key={i} rotation={[-Math.PI/2, 0, 0]} position={[line.start[0], 0.155, (line.start[2]+line.end[2])/2]}>
+               <planeGeometry args={[0.15, Math.abs(line.end[2] - line.start[2])]} />
+               <meshBasicMaterial color="#ffff00" transparent opacity={0.3} side={THREE.DoubleSide} />
+             </mesh>
+           );
+        }
+      })}
+    </group>
+  );
+}
+
+function Breadboard({ onHoleClick, selectedHole, draftStart, activeNodes, isSimulating }) {
   const holes = useMemo(() => {
     const temp = [];
+    // Main
     for (let r=1; r<=ROW_COUNT; r++) {
       for (let c=1; c<=10; c++) temp.push({pos: getHolePos(r,c), r, c});
     }
+    // Power Rails (Left: 0, -1 / Right: 11, 12)
+    for (let r=1; r<=ROW_COUNT; r++) {
+      temp.push({pos: getHolePos(r, 0), r, c: 0});
+      temp.push({pos: getHolePos(r, -1), r, c: -1});
+      temp.push({pos: getHolePos(r, 11), r, c: 11});
+      temp.push({pos: getHolePos(r, 12), r, c: 12});
+    }
     return temp;
   }, []);
+
   return (
     <group position={[0, -0.15, 0]}>
+      {/* Main Board */}
       <RoundedBox args={[5.5, 0.3, ROW_COUNT*PITCH+0.5]} radius={0.1}><meshStandardMaterial color="#fff"/></RoundedBox>
+      {/* Power Rails (Visual only) */}
+      <mesh position={[-2.15, 0.16, 0]} rotation={[-Math.PI/2, 0, 0]}><planeGeometry args={[0.5, ROW_COUNT*PITCH]} /><meshBasicMaterial color="#f8f8f8" /></mesh>
+      <mesh position={[2.15, 0.16, 0]} rotation={[-Math.PI/2, 0, 0]}><planeGeometry args={[0.5, ROW_COUNT*PITCH]} /><meshBasicMaterial color="#f8f8f8" /></mesh>
+      {/* Lines */}
+      <mesh position={[-2.0, 0.17, 0]} rotation={[-Math.PI/2, 0, 0]}><planeGeometry args={[0.05, ROW_COUNT*PITCH]} /><meshBasicMaterial color="red" /></mesh>
+      <mesh position={[-2.3, 0.17, 0]} rotation={[-Math.PI/2, 0, 0]}><planeGeometry args={[0.05, ROW_COUNT*PITCH]} /><meshBasicMaterial color="blue" /></mesh>
+      <mesh position={[2.0, 0.17, 0]} rotation={[-Math.PI/2, 0, 0]}><planeGeometry args={[0.05, ROW_COUNT*PITCH]} /><meshBasicMaterial color="red" /></mesh>
+      <mesh position={[2.3, 0.17, 0]} rotation={[-Math.PI/2, 0, 0]}><planeGeometry args={[0.05, ROW_COUNT*PITCH]} /><meshBasicMaterial color="blue" /></mesh>
+
       <Instances range={holes.length}>
         <boxGeometry args={[0.12, 0.1, 0.12]} />
         <meshStandardMaterial color="#111" />
         {holes.map((h, i) => (<Instance key={i} position={[h.pos[0], 0.15, h.pos[2]]} onClick={(e) => { e.stopPropagation(); onHoleClick(h.r, h.c); }} />))}
       </Instances>
+      
       {selectedHole && <mesh position={[getHolePos(selectedHole.row, selectedHole.col)[0], 0.16, getHolePos(selectedHole.row, selectedHole.col)[2]]} rotation={[-Math.PI/2, 0, 0]}><ringGeometry args={[0.08, 0.12, 32]} /><meshBasicMaterial color="yellow" side={THREE.DoubleSide} /></mesh>}
+      {draftStart && <mesh position={[getHolePos(draftStart.row, draftStart.col)[0], 0.16, getHolePos(draftStart.row, draftStart.col)[2]]} rotation={[-Math.PI/2, 0, 0]}><ringGeometry args={[0.08, 0.12, 32]} /><meshBasicMaterial color="#00ffff" side={THREE.DoubleSide} /></mesh>}
+      <BreadboardInternalFlow activeNodes={activeNodes} isSimulating={isSimulating} />
     </group>
   );
 }
@@ -258,135 +387,170 @@ function Pico({ pinStates }) {
 // --- 4. メインアプリUI ---
 
 export default function App() {
-  const { pinStates, ready, logs, run, stop } = usePythonEngine();
+  const { pinStates, ready, logs, run, stop, isRunning } = usePythonEngine();
   const [leftPanelWidth, setLeftPanelWidth] = useState(500);
   const [editorHeight, setEditorHeight] = useState(400);
   const [hoverInfo, setHoverInfo] = useState(null);
 
-  // 初期データ
+  const [toolMode, setToolMode] = useState('cursor');
+  const [draftStart, setDraftStart] = useState(null);
+  const [editingId, setEditingId] = useState(null); 
+  const [editType, setEditType] = useState(null); 
+
+  // ★初期データ更新 (クリーンな状態)
   const [wires, setWires] = useState([
-    { sR: 20, sC: 2, eR: 25, eC: 2, color: "green", id: 1, level: 2 },
-    { id: 2, sR: 25, sC: 10, eR: 3, eC: 10, color: "black", level: 1 }
+    { id: 1, sR: 20, sC: 2, eR: 25, eC: 2, color: "green", level: 2, name: "Wire 1" },
+    { id: 2, sR: 28, sC: 10, eR: 18, eC: 10, color: "black", level: 1, name: "Wire 2" }
   ]);
   const [leds, setLeds] = useState([
-    { sR: 25, sC: 7, eR: 25, eC: 8, id: 1 }
+    { id: 1, sR: 25, sC: 7, eR: 28, eC: 7, name: "LED 1" }
   ]);
   const [resistors, setResistors] = useState([
-    { sR: 25, sC: 3, eR: 25, eC: 6, scale: 1, ohms: 330, id: 1 }
+    { id: 1, sR: 25, sC: 3, eR: 25, eC: 6, scale: 1, ohms: 330, name: "Resistor 1" }
   ]);
   const [code, setCode] = useState(`import time\ntest = Pin(15, Pin.OUT)\n\nprint("Start")\nfor i in range(5):\n    test.value(1)\n    time.sleep(0.5)\n    test.value(0)\n    time.sleep(0.5)\nprint("Done")`);
 
   const [selectedHole, setSelectedHole] = useState(null);
-  const [editingId, setEditingId] = useState(null); 
-  const [editType, setEditType] = useState(null); 
 
-  const [inputWire, setInputWire] = useState({ sR: 1, sC: 1, eR: 1, eC: 1, color: 'blue' });
-  const [inputLed, setInputLed] = useState({ sR: 1, sC: 1, eR: 2, eC: 1 });
-  const [inputResistor, setInputResistor] = useState({ sR: 1, sC: 1, eR: 2, eC: 1, scale: 1.0, ohms: 330 });
+  const [inputWire, setInputWire] = useState({ sR: 1, sC: 1, eR: 1, eC: 1, color: 'blue', name: 'Wire X' });
+  const [inputLed, setInputLed] = useState({ sR: 1, sC: 1, eR: 2, eC: 1, name: 'LED X' });
+  const [inputResistor, setInputResistor] = useState({ sR: 1, sC: 1, eR: 2, eC: 1, scale: 1.0, ohms: 330, name: 'Res X' });
 
-  // --- ★ 物理演算 (経路探索・接続ロジック) ---
-  const activeComponents = useMemo(() => {
-    // 1. 接続グラフの構築 (Union-Find的なグループ化)
-    const adj = {};
-    const addLink = (id1, id2) => {
-      if(!adj[id1]) adj[id1] = [];
-      if(!adj[id2]) adj[id2] = [];
-      adj[id1].push(id2);
-      adj[id2].push(id1);
+  const [newResistorOhms, setNewResistorOhms] = useState(330);
+  const [newWireColor, setNewWireColor] = useState('green');
+
+  // --- ★ 回路成立チェック (Source to Sink Path Finding) ---
+  const { activeIds, activeNodes } = useMemo(() => {
+    const netMap = {}; 
+    let netCount = 0;
+    const getNetId = (holeId) => {
+      if (netMap[holeId] === undefined) netMap[holeId] = netCount++;
+      return netMap[holeId];
     };
 
-    // 全ての部品の接続を登録
-    [...wires, ...leds, ...resistors].forEach(item => {
-      const start = getHoleId(item.sR, item.sC);
-      const end = getHoleId(item.eR, item.eC);
-      addLink(start, end);
+    // 1. グラフ構築 (電源レール対応)
+    const connAdj = {};
+    const addConn = (id1, id2) => {
+      if(!connAdj[id1]) connAdj[id1] = []; if(!connAdj[id2]) connAdj[id2] = [];
+      connAdj[id1].push(id2); connAdj[id2].push(id1);
+    };
+
+    // 部品の接続
+    const registerComp = (item) => {
+      const h1 = getHoleId(item.sR, item.sC);
+      const h2 = getHoleId(item.eR, item.eC);
+      addConn(h1, h2);
+    };
+    wires.forEach(registerComp); resistors.forEach(registerComp); leds.forEach(registerComp);
+
+    // ブレッドボード内部の接続 (横5穴 & 電源レール縦)
+    // 本来はUnion-Find等でまとめるが、簡易的に「同じネットならつながっている」とするため
+    // ここでは部品の端点ベースでグラフを作る。
+    // ただし、同じ行(Row)の穴同士は自動的につながる必要がある。
+    // -> 簡易化: グラフのノードを「穴ID」ではなく「NetID(行/レール単位)」にするのが正解だが、
+    //    今の実装(HoleID)ベースだと、同じ行の穴を全結合する必要がある。
+    //    → 計算量削減のため、部品の端点が含まれる行だけを「ハブ」として登録する。
+    
+    const rowNodes = {}; // "L-25" -> ["L-25"] (行ごとの穴リスト)
+    // 電源レールも同様 "PL+" -> [...]
+    
+    const getGroupKey = (holeId) => {
+      if (holeId.startsWith('P')) return holeId.split('-')[0]; // PL+, PR-
+      const [side, rowStr] = holeId.split('-');
+      return `${side}-${rowStr}`; // L-25
+    };
+
+    // 部品が刺さっている穴をグループ化
+    const usedHoles = new Set();
+    [...wires, ...leds, ...resistors].forEach(i => {
+      usedHoles.add(getHoleId(i.sR, i.sC));
+      usedHoles.add(getHoleId(i.eR, i.eC));
     });
 
-    // 2. ソース(電源)とシンク(GND)を探す
+    // 同じグループ(行/レール)内の穴同士を結ぶエッジを追加
+    const groups = {};
+    usedHoles.forEach(h => {
+      const key = getGroupKey(h);
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(h);
+    });
+    Object.values(groups).forEach(list => {
+      for(let i=0; i<list.length-1; i++) {
+        addConn(list[i], list[i+1]);
+      }
+    });
+
+
+    // 2. ソース(GPIO High) と シンク(GND) の特定
     const sources = [];
     const sinks = [];
-    
-    // 全ての穴について、GPIO接続かGND接続かをチェック
-    // 接続が存在する穴だけループ
-    Object.keys(adj).forEach(holeId => {
+    usedHoles.forEach(holeId => {
+      if (holeId.startsWith('P')) return; // 電源レールにPicoは刺さらない
       const [side, rowStr] = holeId.split('-');
       const row = parseInt(rowStr);
       const col = side === 'L' ? 1 : 6;
       const pin = getGpioFromHole(row, col);
       
-      // GPIOがHIGHならソース
-      if (pin !== null && pinStates[pin]) {
-        sources.push(holeId);
-      }
-      
-      // GNDピン (Row 3, 8, 13, 18, 23, 28) ならシンク
-      // 左列も右列も同じRow配置と仮定 (Pico仕様)
-      if ([3, 8, 13, 18, 23, 28, 33, 38].includes(row)) {
-        sinks.push(holeId);
-      }
+      if (pin !== null && pinStates[pin]) sources.push(holeId);
+      if (GND_ROWS.includes(row)) sinks.push(holeId);
     });
 
-    // 3. 到達可能チェック (BFS)
-    // ソースから電気が届く場所
+    // 3. BFS (Source -> ?)
     const powered = new Set();
     const queueP = [...sources];
     queueP.forEach(s => powered.add(s));
     while(queueP.length > 0) {
       const curr = queueP.shift();
-      if(adj[curr]) {
-        adj[curr].forEach(next => {
-          if(!powered.has(next)) {
-            powered.add(next);
-            queueP.push(next);
-          }
+      if(connAdj[curr]) {
+        connAdj[curr].forEach(next => {
+          if(!powered.has(next)) { powered.add(next); queueP.push(next); }
         });
       }
     }
 
-    // シンクへ電気が戻れる場所 (逆方向BFS)
+    // 4. BFS (Sink <- ?)
     const grounded = new Set();
     const queueG = [...sinks];
     queueG.forEach(s => grounded.add(s));
     while(queueG.length > 0) {
       const curr = queueG.shift();
-      if(adj[curr]) {
-        adj[curr].forEach(next => {
-          if(!grounded.has(next)) {
-            grounded.add(next);
-            queueG.push(next);
-          }
+      if(connAdj[curr]) {
+        connAdj[curr].forEach(next => {
+          if(!grounded.has(next)) { grounded.add(next); queueG.push(next); }
         });
       }
     }
 
-    // 4. 両方を満たす部品IDを特定
-    const activeIds = new Set();
-    
-    // ワイヤー、LED、抵抗それぞれについてチェック
-    const checkActive = (item) => {
-      const start = getHoleId(item.sR, item.sC);
-      const end = getHoleId(item.eR, item.eC);
-      // 片方がPoweredで片方がGroundedならOK、またはその逆、または両方が両属性持ち(ループ内など)
-      // シンプルに「両端がPoweredかつGroundedな経路上にある」と判定
-      if ((powered.has(start) && grounded.has(end)) || (powered.has(end) && grounded.has(start)) || 
-          (powered.has(start) && grounded.has(start) && powered.has(end) && grounded.has(end))) {
-        activeIds.add(item.id);
+    // 5. 両方につながっている部品だけActive
+    const activeSet = new Set();
+    const check = (item) => {
+      const h1 = getHoleId(item.sR, item.sC);
+      const h2 = getHoleId(item.eR, item.eC);
+      // 両端のどちらかがPowered、もう片方がGrounded... ではなく
+      // 「両端ともPoweredかつGroundedな経路上にある」のが正しい
+      // 簡易的に: 両端が (Powered AND Grounded) セットに含まれるか
+      const p1 = powered.has(h1); const g1 = grounded.has(h1);
+      const p2 = powered.has(h2); const g2 = grounded.has(h2);
+      
+      if ((p1 && g1) || (p2 && g2)) {
+         // 少なくとも片方が有効な経路上にいればOKとみなす (直列回路ならこれで十分)
+         activeSet.add(item.id);
       }
     };
+    [...wires, ...leds, ...resistors].forEach(check);
 
-    wires.forEach(checkActive);
-    leds.forEach(checkActive);
-    resistors.forEach(checkActive);
+    // 可視化用ノード
+    const validNodes = new Set();
+    powered.forEach(n => { if(grounded.has(n)) validNodes.add(n); });
 
-    return activeIds;
+    return { activeIds: activeSet, activeNodes: validNodes };
 
   }, [wires, leds, resistors, pinStates]);
 
-  const isActive = (id) => activeComponents.has(id);
+  const isCompActive = (id) => activeIds.has(id);
 
-  // --- UI制御周り ---
   useEffect(() => {
-    const saved = localStorage.getItem('pico_sim_data_v3');
+    const saved = localStorage.getItem('pico_sim_data_v15'); // Version up
     if (saved) {
       try {
         const data = JSON.parse(saved);
@@ -395,7 +559,7 @@ export default function App() {
     }
   }, []);
   useEffect(() => {
-    localStorage.setItem('pico_sim_data_v3', JSON.stringify({ wires, leds, resistors, code }));
+    localStorage.setItem('pico_sim_data_v15', JSON.stringify({ wires, leds, resistors, code }));
   }, [wires, leds, resistors, code]);
 
   const saveToFile = () => {
@@ -417,53 +581,66 @@ export default function App() {
   const clearCircuit = () => { if(window.confirm("Clear circuit?")) { setWires([]); setLeds([]); setResistors([]); } };
   const clearCode = () => { if(window.confirm("Clear code?")) setCode(""); };
 
-  const startEdit = (item, type) => {
-    setEditingId(item.id); setEditType(type);
-    if (type === 'wire') setInputWire({ sR: item.sR, sC: item.sC, eR: item.eR, eC: item.eC, color: item.color });
-    if (type === 'led') setInputLed({ sR: item.sR, sC: item.sC, eR: item.eR, eC: item.eC });
-    if (type === 'resistor') setInputResistor({ sR: item.sR, sC: item.sC, eR: item.eR, eC: item.eC, scale: item.scale, ohms: item.ohms });
-  };
-  const cancelEdit = () => { setEditingId(null); setEditType(null); };
-  const addOrUpdateWire = () => {
-    const newData = { ...inputWire, sR: Number(inputWire.sR), sC: Number(inputWire.sC), eR: Number(inputWire.eR), eC: Number(inputWire.eC) };
-    if (editingId && editType === 'wire') { setWires(wires.map(w => w.id === editingId ? { ...w, ...newData } : w)); setEditingId(null); }
-    else setWires([...wires, { ...newData, id: Date.now(), level: 2 }]);
-  };
-  const addOrUpdateLed = () => {
-    const newData = { ...inputLed, sR: Number(inputLed.sR), sC: Number(inputLed.sC), eR: Number(inputLed.eR), eC: Number(inputLed.eC) };
-    if (editingId && editType === 'led') { setLeds(leds.map(l => l.id === editingId ? { ...l, ...newData } : l)); setEditingId(null); }
-    else setLeds([...leds, { ...newData, id: Date.now() }]);
-  };
-  const addOrUpdateResistor = () => {
-    const newData = { ...inputResistor, sR: Number(inputResistor.sR), sC: Number(inputResistor.sC), eR: Number(inputResistor.eR), eC: Number(inputResistor.eC), scale: Number(inputResistor.scale), ohms: Number(inputResistor.ohms) };
-    if (editingId && editType === 'resistor') { setResistors(resistors.map(r => r.id === editingId ? { ...r, ...newData } : r)); setEditingId(null); }
-    else setResistors([...resistors, { ...newData, id: Date.now() }]);
-  };
   const removeWire = (id) => setWires(wires.filter(w => w.id !== id));
   const removeLed = (id) => setLeds(leds.filter(l => l.id !== id));
   const removeResistor = (id) => setResistors(resistors.filter(r => r.id !== id));
-  const handleHoleClick = (row, col) => setSelectedHole({ row, col });
-  const setFromSelection = (type, field) => {
-    if (!selectedHole) return;
-    if (type === 'wire') setInputWire(prev => ({ ...prev, [field + 'R']: selectedHole.row, [field + 'C']: selectedHole.col }));
-    else if (type === 'led') setInputLed(prev => ({ ...prev, [field + 'R']: selectedHole.row, [field + 'C']: selectedHole.col }));
-    else if (type === 'resistor') setInputResistor(prev => ({ ...prev, [field + 'R']: selectedHole.row, [field + 'C']: selectedHole.col }));
+
+  const startEdit = (item, type) => {
+    setEditingId(item.id);
+    setEditType(type);
+    setToolMode(type); 
+    setDraftStart(null);
+    if (type === 'wire') setInputWire({ sR: item.sR, sC: item.sC, eR: item.eR, eC: item.eC, color: item.color, name: item.name });
+    if (type === 'led') setInputLed({ sR: item.sR, sC: item.sC, eR: item.eR, eC: item.eC, name: item.name });
+    if (type === 'resistor') setInputResistor({ sR: item.sR, sC: item.sC, eR: item.eR, eC: item.eC, scale: item.scale, ohms: item.ohms, name: item.name });
   };
+
+  const cancelEdit = () => {
+    setEditingId(null); setEditType(null); setDraftStart(null);
+  };
+
+  const handleHoleClick = (row, col) => {
+    if (toolMode === 'cursor') {
+      setSelectedHole({ row, col });
+      return;
+    }
+    if (!draftStart) {
+      setDraftStart({ row, col });
+    } else {
+      const sR = draftStart.row; const sC = draftStart.col;
+      const eR = row; const eC = col;
+      if (sR === eR && sC === eC) { setDraftStart(null); return; }
+
+      if (editingId) {
+        if (editType === 'wire') setWires(wires.map(w => w.id === editingId ? { ...w, sR, sC, eR, eC, color: inputWire.color, name: inputWire.name } : w));
+        else if (editType === 'led') setLeds(leds.map(l => l.id === editingId ? { ...l, sR, sC, eR, eC, name: inputLed.name } : l));
+        else if (editType === 'resistor') setResistors(resistors.map(r => r.id === editingId ? { ...r, sR, sC, eR, eC, ohms: Number(newResistorOhms), name: inputResistor.name } : r));
+        setEditingId(null); setEditType(null);
+      } else {
+        if (toolMode === 'wire') setWires([...wires, { id: Date.now(), sR, sC, eR, eC, color: inputWire.color, level: 2, name: `Wire ${wires.length + 1}` }]);
+        else if (toolMode === 'led') setLeds([...leds, { id: Date.now(), sR, sC, eR, eC, name: `LED ${leds.length + 1}` }]);
+        else if (toolMode === 'resistor') setResistors([...resistors, { id: Date.now(), sR, sC, eR, eC, scale: 1.0, ohms: Number(newResistorOhms), name: `Resistor ${resistors.length + 1}` }]);
+      }
+      setDraftStart(null);
+    }
+  };
+
   const startHorizontalResize = useCallback((e) => { e.preventDefault(); const startX = e.clientX; const startWidth = leftPanelWidth; const onMouseMove = (moveEvent) => setLeftPanelWidth(Math.max(300, Math.min(800, startWidth + (moveEvent.clientX - startX)))); const onMouseUp = () => { document.removeEventListener('mousemove', onMouseMove); document.removeEventListener('mouseup', onMouseUp); }; document.addEventListener('mousemove', onMouseMove); document.addEventListener('mouseup', onMouseUp); }, [leftPanelWidth]);
   const startVerticalResize = useCallback((e) => { e.preventDefault(); const startY = e.clientY; const startHeight = editorHeight; const onMouseMove = (moveEvent) => setEditorHeight(Math.max(200, Math.min(window.innerHeight - 200, startHeight + (moveEvent.clientY - startY)))); const onMouseUp = () => { document.removeEventListener('mousemove', onMouseMove); document.removeEventListener('mouseup', onMouseUp); }; document.addEventListener('mousemove', onMouseMove); document.addEventListener('mouseup', onMouseUp); }, [editorHeight]);
+  const getWireLabelColor = (color) => color === 'black' ? '#aaa' : color;
 
   return (
     <div style={{ height: '100vh', display: 'flex', overflow: 'hidden' }}>
       <div style={{ width: leftPanelWidth, display: 'flex', flexDirection: 'column', background: '#1e1e1e', color: '#fff' }}>
         {/* Editor Area */}
         <div style={{ height: editorHeight, display: 'flex', flexDirection: 'column' }}>
-          <div style={{ padding: '10px', background: '#007acc', fontWeight: 'bold' }}>Selected: {selectedHole ? `Row ${selectedHole.row}, Col ${selectedHole.col}` : "(Click a hole)"}</div>
+          <div style={{ padding: '10px', background: '#007acc', fontWeight: 'bold' }}>Selected: {selectedHole ? (selectedHole.col===0 ? "Power L+" : selectedHole.col===-1 ? "Power L-" : selectedHole.col===11 ? "Power R+" : selectedHole.col===12 ? "Power R-" : `Row ${selectedHole.row}, Col ${selectedHole.col}`) : "(Click a hole)"}</div>
           <div style={{ padding: '5px 10px', background: '#333', display: 'flex', gap: '10px', fontSize:'12px', alignItems:'center', flexWrap:'wrap' }}>
-            <button onClick={saveToFile} style={{cursor:'pointer'}}>💾 Save</button>
-            <label style={{cursor:'pointer', background:'#555', padding:'2px 5px', borderRadius:'3px'}}>📂 Load <input type="file" accept=".json" onChange={loadFromFile} style={{display:'none'}} /></label>
+            <button onClick={saveToFile} style={{cursor:'pointer', border:'none', background:'#555', color:'white', padding:'4px 8px', borderRadius:'3px'}}>💾 Save</button>
+            <label style={{cursor:'pointer', background:'#555', color:'white', padding:'4px 8px', borderRadius:'3px'}}>📂 Load <input type="file" accept=".json" onChange={loadFromFile} style={{display:'none'}} /></label>
             <span style={{width:'1px', height:'15px', background:'#666'}}></span>
-            <button onClick={clearCircuit} style={{cursor:'pointer', color:'#ff9999'}}>🗑 Clear Circuit</button>
-            <button onClick={clearCode} style={{cursor:'pointer', color:'#ff9999'}}>📄 Clear Code</button>
+            <button onClick={clearCircuit} style={{cursor:'pointer', color:'#ff9999', background:'none', border:'none'}}>🗑 Clear</button>
+            <button onClick={clearCode} style={{cursor:'pointer', color:'#ff9999', background:'none', border:'none'}}>📄 Clear Code</button>
           </div>
           <div style={{ padding: '10px', background: '#252526', display: 'flex', gap: '10px' }}>
             <button onClick={() => run(code)} disabled={!ready} style={{ background: 'green', color: 'white', padding: '8px 20px', border:'none', cursor:'pointer', fontWeight:'bold', borderRadius:'4px' }}>▶ Run</button>
@@ -474,45 +651,110 @@ export default function App() {
         </div>
         <div onMouseDown={startVerticalResize} style={{ height: '5px', background: '#444', cursor: 'row-resize', width: '100%', borderTop: '1px solid #333', borderBottom: '1px solid #333' }}></div>
         
-        {/* Component Builders */}
-        <div style={{ flex: 1, overflowY: 'auto', background: '#1e1e1e' }}>
+        <div style={{ flex: 1, overflowY: 'auto', background: '#222' }}>
           <div style={{ padding: '15px' }}>
-            {/* Wire Builder */}
-            <div style={{ marginBottom: '20px' }}>
-              <div style={{ fontWeight: 'bold', marginBottom: '8px', color:'#4ec9b0', display:'flex', justifyContent:'space-between' }}>⚡ Jumper Wires {editingId && editType==='wire' && <button onClick={cancelEdit} style={{fontSize:'10px'}}>Cancel Edit</button>}</div>
-              <div style={{ display: 'flex', gap: '5px', marginBottom:'5px' }}><input type="number" placeholder="SR" value={inputWire.sR} onChange={e=>setInputWire({...inputWire, sR:e.target.value})} style={{width:'35px'}}/><input type="number" placeholder="SC" value={inputWire.sC} onChange={e=>setInputWire({...inputWire, sC:e.target.value})} style={{width:'35px'}}/><button onClick={() => setFromSelection('wire', 's')} style={{fontSize:'10px'}}>Set</button><span style={{color:'#888'}}>→</span><input type="number" placeholder="ER" value={inputWire.eR} onChange={e=>setInputWire({...inputWire, eR:e.target.value})} style={{width:'35px'}}/><input type="number" placeholder="EC" value={inputWire.eC} onChange={e=>setInputWire({...inputWire, eC:e.target.value})} style={{width:'35px'}}/><button onClick={() => setFromSelection('wire', 'e')} style={{fontSize:'10px'}}>Set</button></div>
-              <div style={{display:'flex', gap:'5px'}}><select value={inputWire.color} onChange={e=>setInputWire({...inputWire, color:e.target.value})} style={{flex:1}}><option value="green">Green</option><option value="black">Black</option><option value="red">Red</option><option value="blue">Blue</option><option value="yellow">Yellow</option></select><button onClick={addOrUpdateWire} style={{background: editingId && editType==='wire' ? 'orange':'#eee', color:'black', border:'none', cursor:'pointer'}}>{editingId && editType==='wire' ? 'Update' : 'Add'}</button></div>
-              <div style={{ marginTop: '5px', fontSize: '11px', maxHeight: '80px', overflowY: 'auto', background:'#222', padding:'5px' }}>{wires.map(w => (<div key={w.id} style={{ display: 'flex', justifyContent: 'space-between', marginBottom:'2px', background: editingId===w.id ? '#444': 'transparent' }}><span>{w.color}: {w.sR},{w.sC}→{w.eR},{w.eC}</span><div><button onClick={() => startEdit(w, 'wire')} style={{marginRight:'5px', cursor:'pointer'}}>✎</button><button onClick={() => removeWire(w.id)} style={{color:'red', cursor:'pointer'}}>x</button></div></div>))}</div>
+            <div style={{ fontWeight: 'bold', marginBottom: '10px', color:'#fff', display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+              Toolbox
+              {editingId && <div style={{background:'orange', color:'black', padding:'2px 8px', borderRadius:'4px', fontSize:'11px'}}>EDITING...</div>}
             </div>
-            {/* LED Builder */}
-            <div style={{ marginBottom: '20px' }}>
-              <div style={{ fontWeight: 'bold', marginBottom: '8px', color:'#ce9178', display:'flex', justifyContent:'space-between' }}>💡 LEDs {editingId && editType==='led' && <button onClick={cancelEdit} style={{fontSize:'10px'}}>Cancel Edit</button>}</div>
-              <div style={{ display: 'flex', gap: '5px', marginBottom: '5px' }}><input type="number" placeholder="SR" value={inputLed.sR} onChange={e=>setInputLed({...inputLed, sR:e.target.value})} style={{width:'35px'}}/><input type="number" placeholder="SC" value={inputLed.sC} onChange={e=>setInputLed({...inputLed, sC:e.target.value})} style={{width:'35px'}}/><button onClick={() => setFromSelection('led', 's')} style={{fontSize:'10px'}}>Set</button><span style={{color:'#888'}}>→</span><input type="number" placeholder="ER" value={inputLed.eR} onChange={e=>setInputLed({...inputLed, eR:e.target.value})} style={{width:'35px'}}/><input type="number" placeholder="EC" value={inputLed.eC} onChange={e=>setInputLed({...inputLed, eC:e.target.value})} style={{width:'35px'}}/><button onClick={() => setFromSelection('led', 'e')} style={{fontSize:'10px'}}>Set</button><button onClick={addOrUpdateLed} style={{background: editingId && editType==='led' ? 'orange':'#eee', color:'black', border:'none', cursor:'pointer'}}>{editingId && editType==='led' ? 'Update' : 'Add'}</button></div>
-              <div style={{ fontSize: '11px', maxHeight: '60px', overflowY: 'auto', background:'#222', padding:'5px' }}>{leds.map(l => (<div key={l.id} style={{ display: 'flex', justifyContent: 'space-between', background: editingId===l.id ? '#444': 'transparent' }}><span>LED: {l.sR},{l.sC}→{l.eR},{l.eC}</span><div><button onClick={() => startEdit(l, 'led')} style={{marginRight:'5px', cursor:'pointer'}}>✎</button><button onClick={() => removeLed(l.id)} style={{color:'red', cursor:'pointer'}}>x</button></div></div>))}</div>
+            
+            <div style={{ display: 'flex', gap: '5px', marginBottom: '15px' }}>
+              <button onClick={() => {setToolMode('cursor'); setDraftStart(null); cancelEdit();}} style={{ flex:1, padding:'8px', background: toolMode==='cursor' ? '#007acc':'#444', color:'white', border:'none', cursor:'pointer' }}>👆 Select</button>
+              <button onClick={() => {setToolMode('wire'); setDraftStart(null); cancelEdit();}} style={{ flex:1, padding:'8px', background: toolMode==='wire' ? '#007acc':'#444', color:'white', border:'none', cursor:'pointer' }}>⚡ Wire</button>
+              <button onClick={() => {setToolMode('led'); setDraftStart(null); cancelEdit();}} style={{ flex:1, padding:'8px', background: toolMode==='led' ? '#007acc':'#444', color:'white', border:'none', cursor:'pointer' }}>💡 LED</button>
+              <button onClick={() => {setToolMode('resistor'); setDraftStart(null); cancelEdit();}} style={{ flex:1, padding:'8px', background: toolMode==='resistor' ? '#007acc':'#444', color:'white', border:'none', cursor:'pointer' }}>📏 Res</button>
             </div>
-            {/* Resistor Builder */}
-            <div>
-              <div style={{ fontWeight: 'bold', marginBottom: '8px', color:'#dcdcaa', display:'flex', justifyContent:'space-between' }}>📏 Resistors {editingId && editType==='resistor' && <button onClick={cancelEdit} style={{fontSize:'10px'}}>Cancel Edit</button>}</div>
-               <div style={{ display: 'flex', gap: '5px', marginBottom: '5px', alignItems:'center' }}><input type="number" placeholder="SR" value={inputResistor.sR} onChange={e=>setInputResistor({...inputResistor, sR:e.target.value})} style={{width:'35px'}}/><input type="number" placeholder="SC" value={inputResistor.sC} onChange={e=>setInputResistor({...inputResistor, sC:e.target.value})} style={{width:'35px'}}/><button onClick={() => setFromSelection('resistor', 's')} style={{fontSize:'10px'}}>Set</button><span style={{color:'#888'}}>→</span><input type="number" placeholder="ER" value={inputResistor.eR} onChange={e=>setInputResistor({...inputResistor, eR:e.target.value})} style={{width:'35px'}}/><input type="number" placeholder="EC" value={inputResistor.eC} onChange={e=>setInputResistor({...inputResistor, eC:e.target.value})} style={{width:'35px'}}/><button onClick={() => setFromSelection('resistor', 'e')} style={{fontSize:'10px'}}>Set</button><input type="number" step="0.1" value={inputResistor.scale} onChange={e=>setInputResistor({...inputResistor, scale:e.target.value})} style={{width:'30px'}} placeholder="Sz"/><button onClick={addOrUpdateResistor} style={{background: editingId && editType==='resistor' ? 'orange':'#eee', color:'black', border:'none', cursor:'pointer'}}>{editingId && editType==='resistor' ? 'Update' : 'Add'}</button></div>
-               <div style={{ fontSize: '11px', maxHeight: '60px', overflowY: 'auto', background:'#222', padding:'5px' }}>{resistors.map(r => (<div key={r.id} style={{ display: 'flex', justifyContent: 'space-between', background: editingId===r.id ? '#444': 'transparent' }}><span>Res: {r.sR},{r.sC}→{r.eR},{r.eC} ({r.ohms}Ω)</span><div><button onClick={() => startEdit(r, 'resistor')} style={{marginRight:'5px', cursor:'pointer'}}>✎</button><button onClick={() => removeResistor(r.id)} style={{color:'red', cursor:'pointer'}}>x</button></div></div>))}</div>
+
+            <div style={{ padding:'10px', background:'#333', borderRadius:'4px', marginBottom:'15px' }}>
+              {toolMode === 'cursor' && <div style={{color:'#aaa', fontSize:'12px'}}>Select item from list below to Edit/Delete.</div>}
+              {toolMode === 'wire' && (
+                <div>
+                  <div style={{marginBottom:'5px', color:'#4ec9b0'}}>Wire Settings</div>
+                  {editingId && (
+                    <div style={{marginBottom:'5px'}}>
+                       Name: <input type="text" value={inputWire.name} onChange={e=>setInputWire({...inputWire, name:e.target.value})} style={{width:'100px'}}/>
+                    </div>
+                  )}
+                  <select value={newWireColor} onChange={e=>setNewWireColor(e.target.value)} style={{width:'100%', padding:'5px'}}>
+                    <option value="green">Green</option><option value="black">Black</option><option value="red">Red</option><option value="blue">Blue</option><option value="yellow">Yellow</option>
+                  </select>
+                  <div style={{fontSize:'11px', marginTop:'5px', color:'#ccc'}}>Click Start -> End</div>
+                </div>
+              )}
+              {toolMode === 'led' && (
+                <div>
+                  <div style={{marginBottom:'5px', color:'#ce9178'}}>LED Settings</div>
+                  {editingId && (
+                    <div style={{marginBottom:'5px'}}>
+                       Name: <input type="text" value={inputLed.name} onChange={e=>setInputLed({...inputLed, name:e.target.value})} style={{width:'100px'}}/>
+                    </div>
+                  )}
+                  <div style={{fontSize:'11px', color:'#ccc'}}>Click Anode(+) -> Cathode(-)</div>
+                </div>
+              )}
+              {toolMode === 'resistor' && (
+                <div>
+                  <div style={{marginBottom:'5px', color:'#dcdcaa'}}>Resistor Settings</div>
+                  {editingId && (
+                    <div style={{marginBottom:'5px'}}>
+                       Name: <input type="text" value={inputResistor.name} onChange={e=>setInputResistor({...inputResistor, name:e.target.value})} style={{width:'100px'}}/>
+                    </div>
+                  )}
+                  <input type="number" value={newResistorOhms} onChange={e=>setNewResistorOhms(e.target.value)} style={{width:'60px', marginRight:'5px'}} /> Ω
+                  <div style={{fontSize:'11px', marginTop:'5px', color:'#ccc'}}>Click Start -> End</div>
+                </div>
+              )}
             </div>
+
+            <div style={{ borderTop:'1px solid #444', paddingTop:'10px' }}>
+              <div style={{fontSize:'12px', color:'#888', marginBottom:'5px'}}>Components List</div>
+              <div style={{ maxHeight: '200px', overflowY: 'auto' }}>
+                {wires.map(w => (
+                  <div key={w.id} style={{ display: 'flex', justifyContent: 'space-between', padding:'4px', borderBottom:'1px solid #333', fontSize:'12px', background: editingId===w.id?'#444':'transparent', alignItems:'center' }}>
+                    <span style={{color: getWireLabelColor(w.color), fontWeight:'bold'}}>{w.name}</span>
+                    <div>
+                      <button onClick={() => startEdit(w, 'wire')} style={{marginRight:'5px', cursor:'pointer', border:'none', background:'#555', color:'white', borderRadius:'3px', padding:'2px 6px'}}>✎</button>
+                      <button onClick={() => removeWire(w.id)} style={{color:'white', border:'none', background:'#d33', cursor:'pointer', borderRadius:'3px', padding:'2px 6px'}}>x</button>
+                    </div>
+                  </div>
+                ))}
+                {leds.map(l => (
+                  <div key={l.id} style={{ display: 'flex', justifyContent: 'space-between', padding:'4px', borderBottom:'1px solid #333', fontSize:'12px', background: editingId===l.id?'#444':'transparent', alignItems:'center' }}>
+                    <span style={{color:'#ce9178', fontWeight:'bold'}}>{l.name}</span>
+                    <div>
+                      <button onClick={() => startEdit(l, 'led')} style={{marginRight:'5px', cursor:'pointer', border:'none', background:'#555', color:'white', borderRadius:'3px', padding:'2px 6px'}}>✎</button>
+                      <button onClick={() => removeLed(l.id)} style={{color:'white', border:'none', background:'#d33', cursor:'pointer', borderRadius:'3px', padding:'2px 6px'}}>x</button>
+                    </div>
+                  </div>
+                ))}
+                {resistors.map(r => (
+                  <div key={r.id} style={{ display: 'flex', justifyContent: 'space-between', padding:'4px', borderBottom:'1px solid #333', fontSize:'12px', background: editingId===r.id?'#444':'transparent', alignItems:'center' }}>
+                    <span style={{color:'#dcdcaa', fontWeight:'bold'}}>{r.name} ({r.ohms}Ω)</span>
+                    <div>
+                      <button onClick={() => startEdit(r, 'resistor')} style={{marginRight:'5px', cursor:'pointer', border:'none', background:'#555', color:'white', borderRadius:'3px', padding:'2px 6px'}}>✎</button>
+                      <button onClick={() => removeResistor(r.id)} style={{color:'white', border:'none', background:'#d33', cursor:'pointer', borderRadius:'3px', padding:'2px 6px'}}>x</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
           </div>
         </div>
       </div>
       <div onMouseDown={startHorizontalResize} style={{ width: '5px', background: '#444', cursor: 'col-resize', height: '100%', borderLeft: '1px solid #333', borderRight: '1px solid #333' }}></div>
       
-      {/* 3D View */}
       <div style={{ flex: 1, background: '#111' }}>
         <Canvas camera={{ position: [5, 12, 5], fov: 45 }}>
           <color attach="background" args={['#222']} />
           <ambientLight intensity={0.6} />
           <directionalLight position={[5, 10, 5]} intensity={1} />
           <OrbitControls makeDefault target={[0, 0, 0]} />
-          <Breadboard onHoleClick={handleHoleClick} selectedHole={selectedHole} />
+          <Breadboard onHoleClick={handleHoleClick} selectedHole={selectedHole} draftStart={draftStart} activeNodes={activeNodes} isSimulating={isRunning} />
           <Pico pinStates={pinStates} />
-          {wires.map(w => <CleanWire key={w.id} item={w} hasCurrent={isActive(w.id)} setHoverInfo={setHoverInfo} />)}
-          {leds.map(l => <LEDComponent key={l.id} item={l} hasCurrent={isActive(l.id)} setHoverInfo={setHoverInfo} />)}
-          {resistors.map(r => <ResistorComponent key={r.id} item={r} hasCurrent={isActive(r.id)} setHoverInfo={setHoverInfo} />)}
+          {wires.map(w => <CleanWire key={w.id} item={w} hasCurrent={isCompActive(w.id)} setHoverInfo={setHoverInfo} isSimulating={isRunning} />)}
+          {leds.map(l => <LEDComponent key={l.id} item={l} hasCurrent={isCompActive(l.id)} setHoverInfo={setHoverInfo} isSimulating={isRunning} />)}
+          {resistors.map(r => <ResistorComponent key={r.id} item={r} hasCurrent={isCompActive(r.id)} setHoverInfo={setHoverInfo} isSimulating={isRunning} />)}
           {hoverInfo && <Tooltip position={hoverInfo.pos} text={hoverInfo.text} />}
         </Canvas>
       </div>
